@@ -21,20 +21,16 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 if not openai.api_key:
     raise RuntimeError("OPENAI_API_KEY not set in .env")
 
-# ─── Database Setup ───────────────────────────────────────────────────────────
+import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-DB_CONFIG = {
-    "dbname": os.getenv("DB_NAME", "morehouse_interactions_new"),
-    "user": os.getenv("DB_USER", "morehouse_user_new"),
-    "password": os.getenv("DB_PASSWORD", "securepassword"),
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", "5432")
-}
-
 def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)
+    # Use the full DATABASE_URL from your Render env vars
+    return psycopg2.connect(
+        os.getenv("DATABASE_URL"),
+        cursor_factory=RealDictCursor
+    )
 
 def init_db():
     with get_db_connection() as conn:
@@ -51,6 +47,7 @@ def init_db():
         """)
         conn.commit()
 
+# Initialise the database schema on startup
 init_db()
 
 # ─── URL lookup and STATIC_QAS (unchanged) ────────────────────────────────────
