@@ -16,6 +16,9 @@ from dotenv import load_dotenv
 from fuzzywuzzy import fuzz
 
 # ─── Initialize ──────────────────────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app, resources={r"/ask": {"origins": "*"}, r"/api/analytics": {"origins": "*"}, r"/api/log": {"origins": "*"}})
+
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 if not openai.api_key:
@@ -952,91 +955,9 @@ STATIC_QAS = {
         PAGE_LINKS["co-curricular"],
         "View Co-curricular Activities"
     ),
-    "orchestra": (
-        "Our Music Department offers individual lessons, ensembles, choir and orchestra. See timetables and performance opportunities on our Co-curricular Programme page.",
-        PAGE_LINKS["co-curricular"],
-        "View Co-curricular Activities"
-    ),
-    "music lessons": (
-        "Our Music Department offers individual lessons, ensembles, choir and orchestra. See timetables and performance opportunities on our Co-curricular Programme page.",
-        PAGE_LINKS["co-curricular"],
-        "View Co-curricular Activities"
-    ),
 }
 
-# ─── Button Labels for Correct Logging ────────────────────────────────────────
-BUTTON_LABELS = {
-    "enquiry": "Enquire now",
-    "what are the school fees": "Fees",
-    "what are the registration deadlines": "Deadlines",
-    "where can i find the school lunch menu": "Lunch menu",
-    "what are the term dates": "Term dates",
-    "what are the open events": "Open events",
-    "what is the school uniform": "Uniform",
-    "tell me about scholarships and bursaries": "Scholarships",
-    "how can i contact the school": "Contact us",
-    "what is academic life like": "Academic life",
-    "which subjects do you offer": "Subjects",
-    "tell me about the sixth form": "Sixth Form",
-    "what extracurricular activities do you offer": "Co-curricular",
-    "what sports do you offer": "Sport",
-    "tell me about faith life": "Faith Life",
-    "policies": "Policies",
-    "safeguarding": "Safeguarding"
-}
-
-# ─── Load embeddings & metadata ───────────────────────────────────────────────
-with open("embeddings.pkl", "rb") as f:
-    embeddings = np.stack(pickle.load(f), axis=0)
-with open("metadata.pkl", "rb") as f:
-    metadata = pickle.load(f)
-
-EMB_MODEL = "text-embedding-3-small"
-CHAT_MODEL = "gpt-3.5-turbo"
-
-# ─── System prompt ────────────────────────────────────────────────────────────
-today = date.today().isoformat()
-system_prompt = (
-    f"You are a friendly, professional assistant for More House School.\n"
-    f"Today's date is {today}.\n"
-    "Begin with 'Thank you for your question!' and end with 'Anything else I can help you with today?'.\n"
-    "If you do not know the answer, say 'I'm sorry, I don't have that information.'\n"
-    "Use British spelling."
-)
-
-app = Flask(__name__)
-CORS(app, resources={r"/ask": {"origins": "*"}, r"/api/analytics": {"origins": "*"}})
-
-def cosine_similarities(matrix, vector):
-    dot = matrix @ vector
-    norms = np.linalg.norm(matrix, axis=1) * np.linalg.norm(vector)
-    return dot / (norms + 1e-8)
-
-def remove_bullets(text):
-    return " ".join(
-        line[2:].strip() if line.startswith("- ") else line.strip()
-        for line in text.split("\n")
-    )
-
-def format_response(ans):
-    footer = "Anything else I can help you with today?"
-    ans = ans.replace(footer, "").strip()
-    sents, paras, curr = ans.split(". "), [], []
-    for s in sents:
-        s = s.strip()
-        if not s:
-            continue
-        curr.append(s.rstrip("."))
-        if len(curr) >= 3 or s.endswith("?"):
-            paras.append(". ".join(curr) + ".")
-            curr = []
-    if curr:
-        paras.append(". ".join(curr) + ".")
-    if not paras or not paras[0].startswith("Thank you for your question"):
-        paras.insert(0, "Thank you for your question!")
-    paras.append(footer)
-    return "\n\n".join(paras)
-
+# ─── Helper Functions ────────────────────────────────────────────────────────
 def log_interaction(interaction_type, detail, response_time):
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -1046,120 +967,66 @@ def log_interaction(interaction_type, detail, response_time):
         )
         conn.commit()
 
-@app.route("/", methods=["GET"])
-def home():
-    return "PEN.ai is running."
+def fuzzy_match(query, options, threshold=80):
+    best_match = None
+    highest_score = 0
+    for option in options:
+        score = fuzz.ratio(query.lower(), option.lower())
+        if score > highest_score and score >= threshold:
+            highest_score = score
+            best_match = option
+    return best_match
 
+# ─── Routes ───────────────────────────────────────────────────────────────────
 @app.route("/ask", methods=["POST"])
 @cross_origin()
 def ask():
-    start_time = time.time()
+    try:
+        start_time = time.time()
+        data = request.get_json(force=True)
+        query = data.get("query", "").strip().lower()
+
+        if not query:
+            log_interaction("Typed", "__welcome__", time.time() - start_time)
+            return jsonify({
+                "response": "Welcome to the More House School chatbot! How can I assist you today? Try asking about term dates, fees, or open events, or click a suggestion above."
+            }), 200
+
+        matched_key = fuzzy_match(query, STATIC_QAS.keys())
+        if matched_key:
+            response_text, link, link_label = STATIC_QAS[matched_key]
+            log_interaction("Typed", query, time.time() - start_time)
+            return jsonify({
+                "response": response_text,
+                "link": link,
+                "link_label": link_label
+            }), 200
+
+        return jsonify({"response": "I'm sorry, I don't have an answer for that. Please try rephrasing or contact registrar@morehousemail.org.uk."}), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/log", methods=["POST"])
+@cross_origin()
+def log():
     try:
         data = request.get_json(force=True)
-        question = data.get("question", "").strip()
-        if not question:
-            return jsonify(error="No question provided"), 400
-
-        key = question.lower().rstrip("?")
-
-        # 1) Exact static
-        if key in STATIC_QAS:
-            raw, url, label = STATIC_QAS[key]
-            response_time = (time.time() - start_time) * 1000
-            button_label = BUTTON_LABELS.get(key, key)
-            log_interaction("Button", button_label, response_time)
-            return jsonify(
-                answer=format_response(remove_bullets(raw)),
-                url=url,
-                link_label=label
-            ), 200
-
-        # 2) Fuzzy static
-        for sk, (raw, url, label) in STATIC_QAS.items():
-            if fuzz.partial_ratio(sk, key) > 80:
-                response_time = (time.time() - start_time) * 1000
-                button_label = BUTTON_LABELS.get(sk, sk)
-                log_interaction("Button", button_label, response_time)
-                return jsonify(
-                    answer=format_response(remove_bullets(raw)),
-                    url=url,
-                    link_label=label
-                ), 200
-
-        # 3) Welcome (custom — no “Thank you for your question!”)
-        if question == "__welcome__":
-            raw = (
-                "Hi there! Ask me anything about More House School.\n\n"
-                "We tailor our prospectus to your enquiry. For more details, visit below.\n\n"
-                "Anything else I can help you with today?"
-            )
-            response_time = (time.time() - start_time) * 1000
-            log_interaction("Typed", question, response_time)
-            return jsonify(
-                answer=remove_bullets(raw),
-                url=PAGE_LINKS["enquiry"],
-                link_label="Enquire now"
-            ), 200
-
-        # 4) Guard “how many…”
-        if key.startswith("how many"):
-            response_time = (time.time() - start_time) * 1000
-            log_interaction("Typed", question, response_time)
-            return jsonify(
-                answer=format_response("I'm sorry, I don't have that information."),
-                url=None
-            ), 200
-
-        # 5) Keyword → URL
-        relevant_url = None
-        for k, u in PAGE_LINKS.items():
-            if k in key or any(
-                fuzz.partial_ratio(k, w) > 80 for w in key.split() if len(w) > 3
-            ):
-                relevant_url = u
-                break
-
-        # 6) RAG fallback
-        emb = openai.embeddings.create(model=EMB_MODEL, input=question)
-        q_vec = np.array(emb.data[0].embedding, dtype="float32")
-        sims = cosine_similarities(embeddings, q_vec)
-        top_idxs = sims.argsort()[-20:][::-1]
-        contexts = [metadata[i]["text"] for i in top_idxs]
-        prompt = "Use these passages:\n\n" + "\n---\n".join(contexts)
-        prompt += f"\n\nQuestion: {question}\nAnswer:"
-        chat = openai.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        raw = chat.choices[0].message.content
-        answer = format_response(remove_bullets(raw))
-
-        # 7) Fallback URL + human label
-        if not relevant_url and top_idxs.size:
-            relevant_url = metadata[top_idxs[0]].get("url")
-
-        link_label = URL_LABELS.get(relevant_url)
-        response_time = (time.time() - start_time) * 1000
-        interaction_type = "Link" if relevant_url else "Typed"
-        detail = relevant_url if relevant_url else question
+        interaction_type = data.get("type")
+        detail = data.get("detail")
+        response_time = data.get("responseTime")
+        if not all([interaction_type, detail, response_time is not None]):
+            return jsonify(error="Missing required fields"), 400
         log_interaction(interaction_type, detail, response_time)
-
-        return jsonify(
-            answer=answer,
-            url=relevant_url,
-            link_label=link_label
-        ), 200
-
+        return jsonify(success=True), 200
     except Exception as e:
         traceback.print_exc()
         return jsonify(error=str(e)), 500
 
 @app.route("/api/analytics", methods=["GET"])
 @cross_origin()
-def get_analytics():
+def analytics():
     try:
         start_date = request.args.get("start_date")
         end_date = request.args.get("end_date")
@@ -1170,54 +1037,51 @@ def get_analytics():
             params = []
             if start_date and end_date:
                 query += " WHERE timestamp BETWEEN %s AND %s"
-                params = [start_date, f"{end_date} 23:59:59"]
-            
+                params.extend([start_date, end_date])
             cursor.execute(query, params)
             rows = cursor.fetchall()
 
         total_interactions = len(rows)
         button_clicks = sum(1 for row in rows if row["type"] == "Button")
         link_referrals = sum(1 for row in rows if row["type"] == "Link")
-        typed_questions = sum(1 for row in rows if row["type"] == "Typed")
-        
-        buttons = Counter(row["detail"] for row in rows if row["type"] == "Button")
-        links = Counter(row["detail"] for row in rows if row["type"] == "Link")
-        questions = Counter(row["detail"] for row in rows if row["type"] == "Typed" and row["detail"] != "__welcome__")
-        
-        top_buttons = [{"name": k, "count": v} for k, v in buttons.most_common(5)]
-        top_links = [{"link_url": k, "count": v} for k, v in links.most_common(5)]
-        top_questions = [{"question": k, "count": v} for k, v in questions.most_common(5)]
-        
-        response_times = [row["response_time"] for row in rows[-10:]]
-        
+        interactions_by_type = Counter(row["type"] for row in rows)
+        response_times = [row["response_time"] for row in rows if row["response_time"] is not None]
+
+        top_buttons = Counter(
+            row["detail"] for row in rows if row["type"] == "Button"
+        ).most_common(5)
+        top_links = Counter(
+            row["detail"] for row in rows if row["type"] == "Link"
+        ).most_common(5)
+        top_questions = Counter(
+            row["detail"] for row in rows if row["type"] == "Typed" and row["detail"] != "__welcome__"
+        ).most_common(5)
+
         recent_interactions = [
             {
                 "timestamp": row["timestamp"].isoformat(),
                 "type": row["type"],
                 "detail": row["detail"],
-                "responseTime": row["response_time"]
-            }
-            for row in rows[-10:]
+                "response_time": row["response_time"]
+            } for row in sorted(rows, key=lambda x: x["timestamp"], reverse=True)[:10]
         ]
-        
+
         return jsonify({
             "totalInteractions": total_interactions,
             "buttonClicks": button_clicks,
             "linkReferrals": link_referrals,
-            "interactionsByType": {
-                "typed": typed_questions,
-                "button": button_clicks,
-                "link": link_referrals
-            },
+            "interactionsByType": dict(interactions_by_type),
             "responseTimes": response_times,
-            "recentInteractions": recent_interactions,
-            "topButtons": top_buttons,
-            "topLinks": top_links,
-            "topQuestions": top_questions
+            "topButtons": [{"name": name, "count": count} for name, count in top_buttons],
+            "topLinks": [{"link_url": url, "count": count} for url, count in top_links],
+            "topQuestions": [{"question": q, "count": count} for q, count in top_questions],
+            "recentInteractions": recent_interactions
         }), 200
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+# ─── Run Server ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(debug=True)
